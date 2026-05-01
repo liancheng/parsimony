@@ -10,12 +10,21 @@
 import bisect
 from dataclasses import dataclass
 from itertools import accumulate, chain
-from typing import Sequence, cast
+from typing import Sequence, TypeVar, cast
 
 import lsprotocol.types as L
 from parsimonious.grammar import rule_grammar
 from parsimonious.nodes import Node, NodeVisitor
 from pygls.lsp.server import LanguageServer
+
+U = TypeVar("U")
+
+
+Maybe = tuple[U] | tuple[()]
+
+
+def maybe[U](v: U | None) -> Maybe[U]:
+    return () if v is None else (v,)
 
 
 @dataclass(frozen=True, order=True)
@@ -55,13 +64,17 @@ class Label:
     name: str
 
 
-class Resolver(NodeVisitor):
+class Analyzer(NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
-        self.labels: dict[str, Span] = {}
-        self.references: dict[Span, str] = {}
+        self.reset()
 
-    def resolve(self, node: Node):
+    def reset(self):
+        self.labels: dict[str, Span] = {}
+        self.refs: dict[Span, str] = {}
+        self.ready = False
+
+    def analyze(self, node: Node):
         self.source = node.full_text
         self.lines = node.full_text.splitlines(keepends=True)
 
@@ -76,7 +89,80 @@ class Resolver(NodeVisitor):
             accumulate(chain([0], map(len, self.lines)))
         )
 
-        return self.visit(node)
+        self.visit(node)
+        self.ready = True
+
+    def definition(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
+        return (
+            []
+            if not self.ready
+            else [
+                L.Location(uri, self.labels[name].to_lsp())
+                for name, _ in maybe(self.ref_at(pos))
+            ]
+        )
+
+    def references(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
+        return (
+            []
+            if not self.ready
+            else [
+                L.Location(uri, ref_span.to_lsp())
+                for label_name, _ in maybe(self.label_at(pos))
+                for ref_span, ref_name in self.refs.items()
+                if label_name == ref_name
+            ]
+        )
+
+    def document_symbol(self) -> Sequence[L.DocumentSymbol]:
+        return [
+            L.DocumentSymbol(label, L.SymbolKind.Class, range, range)
+            for label, span in self.labels.items()
+            if (range := span.to_lsp())
+        ]
+
+    def document_highlight(self, pos: L.Position):
+        def to_highlight(span: Span, kind: L.DocumentHighlightKind):
+            return L.DocumentHighlight(span.to_lsp(), kind)
+
+        def highlight_spans():
+            for label_name, label_span in maybe(self.label_at(pos)):
+                yield to_highlight(label_span, L.DocumentHighlightKind.Write)
+                yield from (
+                    to_highlight(ref_span, L.DocumentHighlightKind.Read)
+                    for ref_span, ref_name in self.refs.items()
+                    if label_name == ref_name
+                )
+
+            for ref_name, ref_span in maybe(self.ref_at(pos)):
+                yield to_highlight(ref_span, L.DocumentHighlightKind.Read)
+                yield from (
+                    to_highlight(label_span, L.DocumentHighlightKind.Write)
+                    for label_name, label_span in self.labels.items()
+                    if label_name == ref_name
+                )
+
+        return list(highlight_spans())
+
+    def label_at(self, pos: L.Position) -> tuple[str, Span] | None:
+        return next(
+            (
+                (name, span)
+                for name, span in self.labels.items()
+                if Point.from_lsp(pos) in span
+            ),
+            None,
+        )
+
+    def ref_at(self, pos: L.Position) -> tuple[str, Span] | None:
+        return next(
+            (
+                (name, span)
+                for span, name in self.refs.items()
+                if Point.from_lsp(pos) in span
+            ),
+            None,
+        )
 
     def point_of(self, offset: int) -> Point:
         line = bisect.bisect_right(self.line_offsets, offset) - 1
@@ -91,13 +177,14 @@ class Resolver(NodeVisitor):
         return node
 
     def visit_label(self, node: Node, visited_children: Sequence[Node]):
+        del node
         name, *_ = visited_children
-        return Label(self.span_of(node.start, node.end), name.text)
+        return Label(self.span_of(name.start, name.end), name.text)
 
     def visit_reference(self, node: Node, visited_children: Sequence[Node]):
         label, *_ = visited_children
         label = cast(Label, label)
-        self.references[label.span] = label.name
+        self.refs[label.span] = label.name
         return node
 
     def visit_rule(self, node: Node, visited_children: Sequence[Node]):
@@ -108,7 +195,7 @@ class Resolver(NodeVisitor):
 
 
 class ParsimonyServer(LanguageServer):
-    resolver: Resolver = Resolver()
+    analyzer: Analyzer = Analyzer()
 
     def info(self, message: str):
         self.window_show_message(L.ShowMessageParams(L.MessageType.Info, message))
@@ -123,57 +210,35 @@ server = ParsimonyServer(
 
 @server.feature(L.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: ParsimonyServer, params: L.DidOpenTextDocumentParams):
-    resolver = Resolver()
-    resolver.resolve(rule_grammar.parse(params.text_document.text))
-    ls.resolver = resolver
+    ls.analyzer.reset()
+    ls.analyzer.analyze(rule_grammar.parse(params.text_document.text))
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: ParsimonyServer, params: L.DidChangeTextDocumentParams):
-    uri = params.text_document.uri
-    doc = ls.workspace.get_text_document(uri)
-    resolver = Resolver()
-    resolver.resolve(rule_grammar.parse(doc.source))
-    ls.resolver = resolver
+    doc = ls.workspace.get_text_document(params.text_document.uri)
+    ls.analyzer.reset()
+    ls.analyzer.analyze(rule_grammar.parse(doc.source))
 
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
 def definition(ls: ParsimonyServer, params: L.DefinitionParams):
-    return [
-        L.Location(
-            params.text_document.uri,
-            ls.resolver.labels[label_name].to_lsp(),
-        )
-        for span, label_name in ls.resolver.references.items()
-        if Point.from_lsp(params.position) in span
-    ]
+    return ls.analyzer.definition(params.text_document.uri, params.position)
 
 
 @server.feature(L.TEXT_DOCUMENT_REFERENCES)
 def references(ls: ParsimonyServer, params: L.ReferenceParams):
-    return [
-        L.Location(
-            params.text_document.uri,
-            ref_span.to_lsp(),
-        )
-        for label_name, label_span in ls.resolver.labels.items()
-        if Point.from_lsp(params.position) in label_span
-        for ref_span, ref_name in ls.resolver.references.items()
-        if label_name == ref_name
-    ]
+    return ls.analyzer.references(params.text_document.uri, params.position)
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
 def document_symbol(ls: ParsimonyServer, _: L.DocumentSymbolParams):
-    return [
-        L.DocumentSymbol(
-            name=label,
-            kind=L.SymbolKind.Class,
-            range=span.to_lsp(),
-            selection_range=span.to_lsp(),
-        )
-        for label, span in ls.resolver.labels.items()
-    ]
+    return ls.analyzer.document_symbol()
+
+
+@server.feature(L.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
+def document_highlight(ls: ParsimonyServer, params: L.DocumentHighlightParams):
+    return ls.analyzer.document_highlight(params.position)
 
 
 if __name__ == "__main__":
