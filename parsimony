@@ -1,0 +1,182 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#   "parsimonious",
+#   "pygls",
+# ]
+# ///
+
+import bisect
+from dataclasses import dataclass
+from itertools import accumulate, chain
+from typing import Sequence, cast
+
+import lsprotocol.types as L
+from parsimonious.grammar import rule_grammar
+from parsimonious.nodes import Node, NodeVisitor
+from pygls.lsp.server import LanguageServer
+
+
+@dataclass(frozen=True, order=True)
+class Point:
+    line: int
+    column: int
+
+    def __str__(self) -> str:
+        return f"{self.line}:{self.column}"
+
+    @staticmethod
+    def from_lsp(pos: L.Position):
+        return Point(pos.line, pos.character)
+
+    def to_lsp(self):
+        return L.Position(self.line, self.column)
+
+
+@dataclass(frozen=True)
+class Span:
+    start: Point
+    end: Point
+
+    def __str__(self) -> str:
+        return f"{self.start}-{self.end}"
+
+    def __contains__(self, point: Point) -> bool:
+        return self.start <= point <= self.end
+
+    def to_lsp(self) -> L.Range:
+        return L.Range(self.start.to_lsp(), self.end.to_lsp())
+
+
+@dataclass(frozen=True)
+class Label:
+    span: Span
+    name: str
+
+
+class Resolver(NodeVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.labels: dict[str, Span] = {}
+        self.references: dict[Span, str] = {}
+
+    def resolve(self, node: Node):
+        self.source = node.full_text
+        self.lines = node.full_text.splitlines(keepends=True)
+
+        # When the source ends with a newline, `str.splitlines` does not preserve the
+        # last empty line.
+        if node.full_text.endswith("\n"):
+            self.lines.append("")
+
+        # Computes the character offset of the first character in each line, used for
+        # converting 2D positions to 1D offsets.
+        self.line_offsets: list[int] = list(
+            accumulate(chain([0], map(len, self.lines)))
+        )
+
+        return self.visit(node)
+
+    def point_of(self, offset: int) -> Point:
+        line = bisect.bisect_right(self.line_offsets, offset) - 1
+        column = offset - self.line_offsets[line]
+        return Point(line=line, column=column)
+
+    def span_of(self, start: int, end: int) -> Span:
+        return Span(self.point_of(start), self.point_of(end))
+
+    def generic_visit(self, node: Node, visited_children: Sequence[Node]):
+        del visited_children
+        return node
+
+    def visit_label(self, node: Node, visited_children: Sequence[Node]):
+        name, *_ = visited_children
+        return Label(self.span_of(node.start, node.end), name.text)
+
+    def visit_reference(self, node: Node, visited_children: Sequence[Node]):
+        label, *_ = visited_children
+        label = cast(Label, label)
+        self.references[label.span] = label.name
+        return node
+
+    def visit_rule(self, node: Node, visited_children: Sequence[Node]):
+        label, _, _ = visited_children
+        label = cast(Label, label)
+        self.labels[label.name] = label.span
+        return node
+
+
+class ParsimonyServer(LanguageServer):
+    resolver: Resolver = Resolver()
+
+    def info(self, message: str):
+        self.window_show_message(L.ShowMessageParams(L.MessageType.Info, message))
+
+
+server = ParsimonyServer(
+    name="parsimony",
+    version="v0.1",
+    text_document_sync_kind=L.TextDocumentSyncKind.Full,
+)
+
+
+@server.feature(L.TEXT_DOCUMENT_DID_OPEN)
+def did_open(ls: ParsimonyServer, params: L.DidOpenTextDocumentParams):
+    resolver = Resolver()
+    resolver.resolve(rule_grammar.parse(params.text_document.text))
+    ls.resolver = resolver
+
+
+@server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
+def did_change(ls: ParsimonyServer, params: L.DidChangeTextDocumentParams):
+    uri = params.text_document.uri
+    doc = ls.workspace.get_text_document(uri)
+    resolver = Resolver()
+    resolver.resolve(rule_grammar.parse(doc.source))
+    ls.resolver = resolver
+
+
+@server.feature(L.TEXT_DOCUMENT_DEFINITION)
+def definition(ls: ParsimonyServer, params: L.DefinitionParams):
+    return [
+        L.Location(
+            params.text_document.uri,
+            ls.resolver.labels[label_name].to_lsp(),
+        )
+        for span, label_name in ls.resolver.references.items()
+        if Point.from_lsp(params.position) in span
+    ]
+
+
+@server.feature(L.TEXT_DOCUMENT_REFERENCES)
+def references(ls: ParsimonyServer, params: L.ReferenceParams):
+    return [
+        L.Location(
+            params.text_document.uri,
+            ref_span.to_lsp(),
+        )
+        for label_name, label_span in ls.resolver.labels.items()
+        if Point.from_lsp(params.position) in label_span
+        for ref_span, ref_name in ls.resolver.references.items()
+        if label_name == ref_name
+    ]
+
+
+@server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
+def document_symbol(ls: ParsimonyServer, _: L.DocumentSymbolParams):
+    return [
+        L.DocumentSymbol(
+            name=label,
+            kind=L.SymbolKind.Class,
+            range=span.to_lsp(),
+            selection_range=span.to_lsp(),
+        )
+        for label, span in ls.resolver.labels.items()
+    ]
+
+
+if __name__ == "__main__":
+    server.start_io()
+
+# vim:ft=python
