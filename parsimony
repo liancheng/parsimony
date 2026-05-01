@@ -10,7 +10,7 @@
 import bisect
 from dataclasses import dataclass
 from itertools import accumulate, chain
-from typing import Sequence, TypeVar, cast
+from typing import Iterable, Sequence, TypeVar, cast
 
 import lsprotocol.types as L
 from parsimonious.grammar import rule_grammar
@@ -25,6 +25,10 @@ Maybe = tuple[U] | tuple[()]
 
 def maybe[U](v: U | None) -> Maybe[U]:
     return () if v is None else (v,)
+
+
+def head_or_none[U](i: Iterable[U]) -> U | None:
+    return next(iter(i), None)
 
 
 @dataclass(frozen=True, order=True)
@@ -93,35 +97,39 @@ class Analyzer(NodeVisitor):
         self.ready = True
 
     def definition(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
-        return (
-            []
-            if not self.ready
-            else [
-                L.Location(uri, self.labels[name].to_lsp())
-                for name, _ in maybe(self.ref_at(pos))
-            ]
-        )
+        if not self.ready:
+            return []
+
+        return [
+            L.Location(uri, self.labels[name].to_lsp())
+            for name, _ in maybe(self.ref_at(pos))
+        ]
 
     def references(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
-        return (
-            []
-            if not self.ready
-            else [
-                L.Location(uri, ref_span.to_lsp())
-                for label_name, _ in maybe(self.label_at(pos))
-                for ref_span, ref_name in self.refs.items()
-                if label_name == ref_name
-            ]
-        )
+        if not self.ready:
+            return []
+
+        return [
+            L.Location(uri, ref_span.to_lsp())
+            for label_name, _ in maybe(self.label_at(pos))
+            for ref_span, ref_name in self.refs.items()
+            if label_name == ref_name
+        ]
 
     def document_symbol(self) -> Sequence[L.DocumentSymbol]:
+        if not self.ready:
+            return []
+
         return [
             L.DocumentSymbol(label, L.SymbolKind.Class, range, range)
             for label, span in self.labels.items()
             if (range := span.to_lsp())
         ]
 
-    def document_highlight(self, pos: L.Position):
+    def document_highlight(self, pos: L.Position) -> Sequence[L.DocumentHighlight]:
+        if not self.ready:
+            return []
+
         def to_highlight(span: Span, kind: L.DocumentHighlightKind):
             return L.DocumentHighlight(span.to_lsp(), kind)
 
@@ -143,6 +151,38 @@ class Analyzer(NodeVisitor):
                 )
 
         return list(highlight_spans())
+
+    def prepare_rename(self, pos: L.Position) -> L.PrepareRenamePlaceholder | None:
+        if not self.ready:
+            return None
+
+        for label_name, label_span in maybe(self.label_at(pos)):
+            return L.PrepareRenamePlaceholder(label_span.to_lsp(), label_name)
+
+        for ref_name, ref_span in maybe(self.ref_at(pos)):
+            return L.PrepareRenamePlaceholder(ref_span.to_lsp(), ref_name)
+
+        return None
+
+    def rename(self, uri: str, pos: L.Position, new_name: str) -> L.WorkspaceEdit:
+        def text_edits():
+            for name, label_span in maybe(self.label_at(pos)):
+                yield L.TextEdit(label_span.to_lsp(), new_name)
+                yield from (
+                    L.TextEdit(ref_span.to_lsp(), new_name)
+                    for ref_span, ref_name in self.refs.items()
+                    if name == ref_name
+                )
+
+            for name, _ in maybe(self.ref_at(pos)):
+                yield L.TextEdit(self.labels[name].to_lsp(), new_name)
+                yield from (
+                    L.TextEdit(ref_span.to_lsp(), new_name)
+                    for ref_span, ref_name in self.refs.items()
+                    if name == ref_name
+                )
+
+        return L.WorkspaceEdit(changes={uri: list(text_edits())})
 
     def label_at(self, pos: L.Position) -> tuple[str, Span] | None:
         return next(
@@ -240,6 +280,18 @@ def document_symbol(ls: ParsimonyServer, _: L.DocumentSymbolParams):
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
 def document_highlight(ls: ParsimonyServer, params: L.DocumentHighlightParams):
     return ls.analyzer.document_highlight(params.position)
+
+
+@server.feature(L.TEXT_DOCUMENT_PREPARE_RENAME)
+def prepare_rename(ls: ParsimonyServer, params: L.PrepareRenameParams):
+    return ls.analyzer.prepare_rename(params.position)
+
+
+@server.feature(L.TEXT_DOCUMENT_RENAME)
+def rename(ls: ParsimonyServer, params: L.RenameParams):
+    return ls.analyzer.rename(
+        params.text_document.uri, params.position, params.new_name
+    )
 
 
 if __name__ == "__main__":
