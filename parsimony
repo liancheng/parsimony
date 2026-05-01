@@ -10,7 +10,7 @@
 import bisect
 from dataclasses import dataclass
 from itertools import accumulate, chain
-from typing import Iterable, Sequence, TypeVar, cast
+from typing import Sequence, TypeVar, cast
 
 import lsprotocol.types as L
 from parsimonious.grammar import rule_grammar
@@ -24,20 +24,19 @@ Maybe = tuple[U] | tuple[()]
 
 
 def maybe[U](v: U | None) -> Maybe[U]:
+    """Turns an optional value into an for-loop friendly `Iterable`."""
     return () if v is None else (v,)
 
 
-def head_or_none[U](i: Iterable[U]) -> U | None:
-    return next(iter(i), None)
+# NOTE: The following custom `Point` and `Span` classes are needed because the PyGLS
+# `Position` and `Range` classes are non-hashable, while Parsimony needs `Span`s as
+# dictionary keys.
 
 
 @dataclass(frozen=True, order=True)
 class Point:
     line: int
     column: int
-
-    def __str__(self) -> str:
-        return f"{self.line}:{self.column}"
 
     @staticmethod
     def from_lsp(pos: L.Position):
@@ -51,9 +50,6 @@ class Point:
 class Span:
     start: Point
     end: Point
-
-    def __str__(self) -> str:
-        return f"{self.start}-{self.end}"
 
     def __contains__(self, point: Point) -> bool:
         return self.start <= point <= self.end
@@ -76,7 +72,8 @@ class Analyzer(NodeVisitor):
     def reset(self):
         self.labels: dict[str, Span] = {}
         self.refs: dict[Span, str] = {}
-        self.ready = False
+        self.analyzed = False
+        return self
 
     def analyze(self, node: Node):
         self.source = node.full_text
@@ -88,16 +85,16 @@ class Analyzer(NodeVisitor):
             self.lines.append("")
 
         # Computes the character offset of the first character in each line, used for
-        # converting 2D positions to 1D offsets.
+        # conversions between 2D points and 1D offsets.
         self.line_offsets: list[int] = list(
             accumulate(chain([0], map(len, self.lines)))
         )
 
         self.visit(node)
-        self.ready = True
+        self.analyzed = True
 
     def definition(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
-        if not self.ready:
+        if not self.analyzed:
             return []
 
         return [
@@ -106,7 +103,7 @@ class Analyzer(NodeVisitor):
         ]
 
     def references(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
-        if not self.ready:
+        if not self.analyzed:
             return []
 
         return [
@@ -117,7 +114,7 @@ class Analyzer(NodeVisitor):
         ]
 
     def document_symbol(self) -> Sequence[L.DocumentSymbol]:
-        if not self.ready:
+        if not self.analyzed:
             return []
 
         return [
@@ -127,7 +124,7 @@ class Analyzer(NodeVisitor):
         ]
 
     def document_highlight(self, pos: L.Position) -> Sequence[L.DocumentHighlight]:
-        if not self.ready:
+        if not self.analyzed:
             return []
 
         def to_highlight(span: Span, kind: L.DocumentHighlightKind):
@@ -153,7 +150,7 @@ class Analyzer(NodeVisitor):
         return list(highlight_spans())
 
     def prepare_rename(self, pos: L.Position) -> L.PrepareRenamePlaceholder | None:
-        if not self.ready:
+        if not self.analyzed:
             return None
 
         for label_name, label_span in maybe(self.label_at(pos)):
@@ -238,9 +235,6 @@ class Analyzer(NodeVisitor):
 class ParsimonyServer(LanguageServer):
     analyzer: Analyzer = Analyzer()
 
-    def info(self, message: str):
-        self.window_show_message(L.ShowMessageParams(L.MessageType.Info, message))
-
 
 server = ParsimonyServer(
     name="parsimony",
@@ -251,15 +245,13 @@ server = ParsimonyServer(
 
 @server.feature(L.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: ParsimonyServer, params: L.DidOpenTextDocumentParams):
-    ls.analyzer.reset()
-    ls.analyzer.analyze(rule_grammar.parse(params.text_document.text))
+    ls.analyzer.reset().analyze(rule_grammar.parse(params.text_document.text))
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: ParsimonyServer, params: L.DidChangeTextDocumentParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    ls.analyzer.reset()
-    ls.analyzer.analyze(rule_grammar.parse(doc.source))
+    ls.analyzer.reset().analyze(rule_grammar.parse(doc.source))
 
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
