@@ -28,22 +28,21 @@ def maybe[U](v: U | None) -> Maybe[U]:
     return () if v is None else (v,)
 
 
-# NOTE: The following custom `Point` and `Span` classes are needed because the PyGLS
-# `Position` and `Range` classes are non-hashable, while Parsimony needs `Span`s as
-# dictionary keys.
+# NOTE: The `Point` and `Span` classes are needed because the PyGLS `Position` and
+# `Range` classes are non-hashable, while Parsimony needs `Span`s as dictionary keys.
 
 
 @dataclass(frozen=True, order=True)
 class Point:
     line: int
-    column: int
+    character: int
 
     @staticmethod
     def from_lsp(pos: L.Position):
         return Point(pos.line, pos.character)
 
     def to_lsp(self):
-        return L.Position(self.line, self.column)
+        return L.Position(self.line, self.character)
 
 
 @dataclass(frozen=True)
@@ -64,6 +63,61 @@ class Label:
     name: str
 
 
+SUPPORTED_SEMANTIC_TOKEN_TYPES = [
+    L.SemanticTokenTypes.Comment,
+    L.SemanticTokenTypes.Label,
+    L.SemanticTokenTypes.Operator,
+    L.SemanticTokenTypes.Regexp,
+    L.SemanticTokenTypes.String,
+    L.SemanticTokenTypes.Variable,
+]
+
+
+@dataclass
+class Token:
+    start: Point
+    length: int
+    type: L.SemanticTokenTypes
+
+
+class SemanticTokensEncoder:
+    def __init__(self) -> None:
+        self.last_line: int = 0
+        self.last_start_char: int = 0
+        self.tokens: list[Token] = []
+        self.encoded: list[int] = []
+
+    def add(self, text: str, start: Point, type: L.SemanticTokenTypes):
+        self.tokens.append(Token(start, len(text), type))
+
+    def encode(self):
+        self.last_line: int = 0
+        self.last_start_char: int = 0
+        self.tokens.sort(key=lambda token: token.start)
+        self.encoded = []
+
+        for token in self.tokens:
+            delta_start_line = token.start.line - self.last_line
+
+            # `delta_start_char` must be absolute if the current token is on a different
+            # line than the last token.
+            delta_start_char = (
+                token.start.character
+                if delta_start_line != 0
+                else token.start.character - self.last_start_char
+            )
+
+            self.last_line = token.start.line
+            self.last_start_char = token.start.character
+
+            self.encoded.append(delta_start_line)
+            self.encoded.append(delta_start_char)
+            self.encoded.append(token.length)
+            self.encoded.append(SUPPORTED_SEMANTIC_TOKEN_TYPES.index(token.type))
+            # Token modifiers, not used, always 0
+            self.encoded.append(0)
+
+
 class Analyzer(NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
@@ -73,6 +127,7 @@ class Analyzer(NodeVisitor):
         self.labels: dict[str, Span] = {}
         self.refs: dict[Span, str] = {}
         self.analyzed = False
+        self.tokens = SemanticTokensEncoder()
         return self
 
     def analyze(self, node: Node):
@@ -118,7 +173,7 @@ class Analyzer(NodeVisitor):
             return []
 
         return [
-            L.DocumentSymbol(label, L.SymbolKind.Class, range, range)
+            L.DocumentSymbol(label, L.SymbolKind.Constructor, range, range)
             for label, span in self.labels.items()
             if (range := span.to_lsp())
         ]
@@ -148,6 +203,10 @@ class Analyzer(NodeVisitor):
                 )
 
         return list(highlight_spans())
+
+    def semantic_tokens(self) -> L.SemanticTokens:
+        self.tokens.encode()
+        return L.SemanticTokens(data=self.tokens.encoded)
 
     def prepare_rename(self, pos: L.Position) -> L.PrepareRenamePlaceholder | None:
         if not self.analyzed:
@@ -201,33 +260,42 @@ class Analyzer(NodeVisitor):
             None,
         )
 
+    def point_of(self, offset: int) -> Point:
+        line = bisect.bisect_right(self.line_offsets, offset) - 1
+        column = offset - self.line_offsets[line]
+        return Point(line=line, character=column)
+
+    def span_of(self, start: int, end: int) -> Span:
+        return Span(self.point_of(start), self.point_of(end))
+
     def generic_visit(self, node: Node, visited_children: Sequence[Node]):
         del visited_children
         return node
 
     def visit_label(self, node: Node, visited_children: Sequence[Node]):
         del node
-
-        def point_of(offset: int) -> Point:
-            line = bisect.bisect_right(self.line_offsets, offset) - 1
-            column = offset - self.line_offsets[line]
-            return Point(line=line, column=column)
-
-        def span_of(start: int, end: int) -> Span:
-            return Span(point_of(start), point_of(end))
-
         name, *_ = visited_children
-        return Label(span_of(name.start, name.end), name.text)
+        return Label(self.span_of(name.start, name.end), name.text)
+
+    def visit_comment(self, node: Node, _: Sequence[Node]):
+        self.tokens.add(
+            node.text,
+            self.point_of(node.start),
+            L.SemanticTokenTypes.Comment,
+        )
+        return node
 
     def visit_reference(self, node: Node, visited_children: Sequence[Node]):
         label, *_ = visited_children
         label = cast(Label, label)
+        self.tokens.add(label.name, label.span.start, L.SemanticTokenTypes.Parameter)
         self.refs[label.span] = label.name
         return node
 
     def visit_rule(self, node: Node, visited_children: Sequence[Node]):
         label, _, _ = visited_children
         label = cast(Label, label)
+        self.tokens.add(label.name, label.span.start, L.SemanticTokenTypes.Variable)
         self.labels[label.name] = label.span
         return node
 
@@ -284,6 +352,17 @@ def rename(ls: ParsimonyServer, params: L.RenameParams):
     return ls.analyzer.rename(
         params.text_document.uri, params.position, params.new_name
     )
+
+
+@server.feature(
+    L.TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL,
+    L.SemanticTokensLegend(
+        token_types=SUPPORTED_SEMANTIC_TOKEN_TYPES,
+        token_modifiers=[],
+    ),
+)
+def semantic_tokens_full(ls: ParsimonyServer, _: L.SemanticTokensParams):
+    return ls.analyzer.semantic_tokens()
 
 
 if __name__ == "__main__":
