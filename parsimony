@@ -8,11 +8,13 @@
 # ///
 
 import bisect
+import contextlib
 from dataclasses import dataclass
 from itertools import accumulate, chain
 from typing import Sequence, TypeVar
 
 import lsprotocol.types as L
+from parsimonious.exceptions import ParsimoniousError
 from parsimonious.grammar import rule_grammar
 from parsimonious.nodes import Node, NodeVisitor
 from pygls.lsp.server import LanguageServer
@@ -341,13 +343,15 @@ server = ParsimonyServer(
 
 @server.feature(L.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: ParsimonyServer, params: L.DidOpenTextDocumentParams):
-    ls.analyzer.reset().analyze(rule_grammar.parse(params.text_document.text))
+    with contextlib.suppress(ParsimoniousError):
+        ls.analyzer.reset().analyze(rule_grammar.parse(params.text_document.text))
 
 
 @server.feature(L.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: ParsimonyServer, params: L.DidChangeTextDocumentParams):
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    ls.analyzer.reset().analyze(rule_grammar.parse(doc.source))
+    with contextlib.suppress(ParsimoniousError):
+        ls.analyzer.reset().analyze(rule_grammar.parse(doc.source))
 
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
