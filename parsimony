@@ -11,7 +11,7 @@ import bisect
 import contextlib
 from dataclasses import dataclass
 from itertools import accumulate, chain
-from typing import Sequence, TypeVar
+from typing import Sequence
 
 import lsprotocol.types as L
 from parsimonious.exceptions import ParsimoniousError
@@ -19,10 +19,7 @@ from parsimonious.grammar import rule_grammar
 from parsimonious.nodes import Node, NodeVisitor
 from pygls.lsp.server import LanguageServer
 
-U = TypeVar("U")
-
-
-Maybe = tuple[U] | tuple[()]
+type Maybe[U] = tuple[U] | tuple[()]
 
 
 def maybe[U](v: U | None) -> Maybe[U]:
@@ -66,10 +63,11 @@ class Token:
     type: L.SemanticTokenTypes
 
 
+TOKEN_TYPE_INDEX = {type: index for index, type in enumerate(L.SemanticTokenTypes)}
+
+
 class SemanticTokensEncoder:
     def __init__(self) -> None:
-        self.last_line: int = 0
-        self.last_start_char: int = 0
         self.tokens: list[Token] = []
         self.encoded: list[int] = []
 
@@ -77,29 +75,30 @@ class SemanticTokensEncoder:
         self.tokens.append(token)
 
     def encode(self):
-        self.last_line: int = 0
-        self.last_start_char: int = 0
         self.tokens.sort(key=lambda token: token.start)
         self.encoded = []
 
+        last_line = 0
+        last_start_char = 0
+
         for token in self.tokens:
-            delta_start_line = token.start.line - self.last_line
+            delta_start_line = token.start.line - last_line
 
             # `delta_start_char` must be absolute if the current token is on a different
             # line than the last token.
             delta_start_char = (
                 token.start.character
                 if delta_start_line != 0
-                else token.start.character - self.last_start_char
+                else token.start.character - last_start_char
             )
 
-            self.last_line = token.start.line
-            self.last_start_char = token.start.character
+            last_line = token.start.line
+            last_start_char = token.start.character
 
             self.encoded.append(delta_start_line)
             self.encoded.append(delta_start_char)
             self.encoded.append(token.length)
-            self.encoded.append(list(L.SemanticTokenTypes).index(token.type))
+            self.encoded.append(TOKEN_TYPE_INDEX[token.type])
             # Token modifiers, not used, always 0
             self.encoded.append(0)
 
@@ -117,19 +116,16 @@ class Analyzer(NodeVisitor):
         return self
 
     def analyze(self, node: Node):
-        self.source = node.full_text
-        self.lines = node.full_text.splitlines(keepends=True)
+        lines = node.full_text.splitlines(keepends=True)
 
         # When the source ends with a newline, `str.splitlines` does not preserve the
         # last empty line.
         if node.full_text.endswith("\n"):
-            self.lines.append("")
+            lines.append("")
 
         # Computes the character offset of the first character in each line, used for
         # conversions between 2D points and 1D offsets.
-        self.line_offsets: list[int] = list(
-            accumulate(chain([0], map(len, self.lines)))
-        )
+        self.line_offsets: list[int] = list(accumulate(chain([0], map(len, lines))))
 
         self.visit(node)
         self.analyzed = True
@@ -159,9 +155,13 @@ class Analyzer(NodeVisitor):
             return []
 
         return [
-            L.DocumentSymbol(label, L.SymbolKind.Constructor, range, range)
-            for label, span in self.labels.items()
-            if (range := span.to_lsp())
+            L.DocumentSymbol(
+                name=name,
+                kind=L.SymbolKind.Constructor,
+                range=span.to_lsp(),
+                selection_range=span.to_lsp(),
+            )
+            for name, span in self.labels.items()
         ]
 
     def document_highlight(self, pos: L.Position) -> Sequence[L.DocumentHighlight]:
@@ -251,14 +251,11 @@ class Analyzer(NodeVisitor):
         column = offset - self.line_offsets[line]
         return Point(line=line, character=column)
 
-    def start_of(self, node: Node) -> Point:
-        return self.point_of(node.start)
-
     def span_of(self, node: Node) -> Span:
         return Span(self.point_of(node.start), self.point_of(node.end))
 
     def emit_token(self, node: Node, type: L.SemanticTokenTypes):
-        self.tokens.emit(Token(self.start_of(node), len(node.text), type))
+        self.tokens.emit(Token(self.point_of(node.start), len(node.text), type))
 
     def generic_visit(self, node: Node, visited_children: Sequence[Node]):
         del visited_children
@@ -268,40 +265,26 @@ class Analyzer(NodeVisitor):
         self.emit_token(node, L.SemanticTokenTypes.Comment)
         return node
 
-    def visit_equals(self, node: Node, visited_children: Sequence[Node]):
+    def _emit_operator_token(self, node: Node, visited_children: Sequence[Node]):
         op, *_ = visited_children
         self.emit_token(op, L.SemanticTokenTypes.Operator)
         return node
+
+    visit_equals = _emit_operator_token
+    visit_lookahead = _emit_operator_token
+    visit_not_term = _emit_operator_token
+    visit_or_term = _emit_operator_token
+    visit_quantifier = _emit_operator_token
 
     def visit_label(self, node: Node, visited_children: Sequence[Node]):
         del node
         label, *_ = visited_children
         return label
 
-    def visit_lookahead(self, node: Node, visited_children: Sequence[Node]):
-        op, *_ = visited_children
-        self.emit_token(op, L.SemanticTokenTypes.Operator)
-        return node
-
-    def visit_not_term(self, node: Node, visited_children: Sequence[Node]):
-        op, *_ = visited_children
-        self.emit_token(op, L.SemanticTokenTypes.Operator)
-        return node
-
-    def visit_or_term(self, node: Node, visited_children: Sequence[Node]):
-        op, *_ = visited_children
-        self.emit_token(op, L.SemanticTokenTypes.Operator)
-        return node
-
     def visit_parenthesized(self, node: Node, visited_children: Sequence[Node]):
         lparen, _, _, rparen, *_ = visited_children
         self.emit_token(lparen, L.SemanticTokenTypes.Operator)
         self.emit_token(rparen, L.SemanticTokenTypes.Operator)
-        return node
-
-    def visit_quantifier(self, node: Node, visited_children: Sequence[Node]):
-        op, *_ = visited_children
-        self.emit_token(op, L.SemanticTokenTypes.Operator)
         return node
 
     def visit_reference(self, node: Node, visited_children: Sequence[Node]):
