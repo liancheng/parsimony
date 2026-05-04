@@ -10,6 +10,7 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
+from enum import IntEnum, auto
 from itertools import accumulate, chain
 from typing import Sequence
 
@@ -64,6 +65,11 @@ class Token:
 
 
 TOKEN_TYPE_INDEX = {type: index for index, type in enumerate(L.SemanticTokenTypes)}
+
+
+class SymbolType(IntEnum):
+    Label = auto()
+    Reference = auto()
 
 
 class SemanticTokensEncoder:
@@ -136,7 +142,8 @@ class Analyzer(NodeVisitor):
 
         return [
             L.Location(uri, self.labels[name].to_lsp())
-            for name, _ in maybe(self.ref_at(pos))
+            for symbol_type, name, _ in maybe(self.symbol_at(pos))
+            if symbol_type == SymbolType.Reference
         ]
 
     def references(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
@@ -145,7 +152,8 @@ class Analyzer(NodeVisitor):
 
         return [
             L.Location(uri, ref_span.to_lsp())
-            for label_name, _ in maybe(self.label_at(pos))
+            for symbol_type, label_name, _ in maybe(self.symbol_at(pos))
+            if symbol_type == SymbolType.Label
             for ref_span, ref_name in self.refs.items()
             if label_name == ref_name
         ]
@@ -172,20 +180,18 @@ class Analyzer(NodeVisitor):
             return L.DocumentHighlight(span.to_lsp(), kind)
 
         def highlight_spans():
-            for label_name, label_span in maybe(self.label_at(pos)):
-                yield to_highlight(label_span, L.DocumentHighlightKind.Write)
+            for symbol_type, name, span in maybe(self.symbol_at(pos)):
+                # Highlights the label definition
+                yield to_highlight(
+                    span if symbol_type == SymbolType.Label else self.labels[name],
+                    L.DocumentHighlightKind.Write,
+                )
+
+                # Highlights all the label references
                 yield from (
                     to_highlight(ref_span, L.DocumentHighlightKind.Read)
                     for ref_span, ref_name in self.refs.items()
-                    if label_name == ref_name
-                )
-
-            for ref_name, ref_span in maybe(self.ref_at(pos)):
-                yield to_highlight(ref_span, L.DocumentHighlightKind.Read)
-                yield from (
-                    to_highlight(label_span, L.DocumentHighlightKind.Write)
-                    for label_name, label_span in self.labels.items()
-                    if label_name == ref_name
+                    if ref_name == name
                 )
 
         return list(highlight_spans())
@@ -198,26 +204,20 @@ class Analyzer(NodeVisitor):
         if not self.analyzed:
             return None
 
-        for label_name, label_span in maybe(self.label_at(pos)):
-            return L.PrepareRenamePlaceholder(label_span.to_lsp(), label_name)
-
-        for ref_name, ref_span in maybe(self.ref_at(pos)):
-            return L.PrepareRenamePlaceholder(ref_span.to_lsp(), ref_name)
+        for _, name, span in maybe(self.symbol_at(pos)):
+            return L.PrepareRenamePlaceholder(span.to_lsp(), name)
 
         return None
 
     def rename(self, uri: str, pos: L.Position, new_name: str) -> L.WorkspaceEdit:
         def text_edits():
-            for name, label_span in maybe(self.label_at(pos)):
-                yield L.TextEdit(label_span.to_lsp(), new_name)
-                yield from (
-                    L.TextEdit(ref_span.to_lsp(), new_name)
-                    for ref_span, ref_name in self.refs.items()
-                    if name == ref_name
+            for symbol_type, name, span in maybe(self.symbol_at(pos)):
+                yield (
+                    L.TextEdit(span.to_lsp(), new_name)
+                    if symbol_type == SymbolType.Label
+                    else L.TextEdit(self.labels[name].to_lsp(), new_name)
                 )
 
-            for name, _ in maybe(self.ref_at(pos)):
-                yield L.TextEdit(self.labels[name].to_lsp(), new_name)
                 yield from (
                     L.TextEdit(ref_span.to_lsp(), new_name)
                     for ref_span, ref_name in self.refs.items()
@@ -226,25 +226,20 @@ class Analyzer(NodeVisitor):
 
         return L.WorkspaceEdit(changes={uri: list(text_edits())})
 
-    def label_at(self, pos: L.Position) -> tuple[str, Span] | None:
-        return next(
-            (
-                (name, span)
-                for name, span in self.labels.items()
-                if span.contains(Point.from_lsp(pos))
-            ),
-            None,
+    def symbol_at(self, pos: L.Position) -> tuple[SymbolType, str, Span] | None:
+        label = (
+            (SymbolType.Label, name, span)
+            for name, span in self.labels.items()
+            if span.contains(Point.from_lsp(pos))
         )
 
-    def ref_at(self, pos: L.Position) -> tuple[str, Span] | None:
-        return next(
-            (
-                (name, span)
-                for span, name in self.refs.items()
-                if span.contains(Point.from_lsp(pos))
-            ),
-            None,
+        ref = (
+            (SymbolType.Reference, name, span)
+            for span, name in self.refs.items()
+            if span.contains(Point.from_lsp(pos))
         )
+
+        return next(chain(label, ref), None)
 
     def point_of(self, offset: int) -> Point:
         line = bisect.bisect_right(self.line_offsets, offset) - 1
