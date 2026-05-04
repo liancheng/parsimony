@@ -289,9 +289,10 @@ class Analyzer(NodeVisitor):
         return node
 
     def visit_regex(self, node: Node, visited_children: Sequence[Node]):
-        op, literal, *_ = visited_children
+        op, literal, flags, *_ = visited_children
         self.emit_token(op, L.SemanticTokenTypes.Operator)
         self.emit_token(literal, L.SemanticTokenTypes.Regexp)
+        self.emit_token(flags, L.SemanticTokenTypes.Operator)
         return node
 
     def visit_rule(self, node: Node, visited_children: Sequence[Node]):
