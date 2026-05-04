@@ -301,8 +301,9 @@ class Analyzer(NodeVisitor):
         self.labels[label.text] = self.span_of(label)
         return node
 
-    def visit_spaceless_literal(self, node: Node, _: Sequence[Node]):
-        self.emit_token(node, L.SemanticTokenTypes.String)
+    def visit_literal(self, node: Node, visited_children: Sequence[Node]):
+        literal, *_ = visited_children
+        self.emit_token(literal, L.SemanticTokenTypes.String)
         return node
 
 
