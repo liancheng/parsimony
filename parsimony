@@ -10,9 +10,8 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
-from enum import IntEnum, auto
 from itertools import accumulate, chain
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import lsprotocol.types as L
 from parsimonious.exceptions import ParsimoniousError
@@ -67,11 +66,6 @@ class Token:
 
 
 TOKEN_TYPE_INDEX = {type: index for index, type in enumerate(L.SemanticTokenTypes)}
-
-
-class SymbolType(IntEnum):
-    Label = auto()
-    Reference = auto()
 
 
 class SemanticTokensEncoder:
@@ -138,32 +132,39 @@ class Analyzer(NodeVisitor):
         self.visit(node)
         self.analyzed = True
 
-    def definition(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
-        if not self.analyzed:
-            return []
+    def find_symbol(self, point: Point) -> tuple[str, Span] | None:
+        labels = self.labels.items()
+        refs = ((name, span) for span, name in self.refs.items())
+        symbols = chain(labels, refs)
+        return next(
+            ((name, span) for name, span in symbols if span.contains(point)), None
+        )
 
-        return [
-            L.Location(uri, self.labels[name].lsp)
-            for symbol_type, name, _ in maybe(self.symbol_at(pos))
-            if symbol_type == SymbolType.Reference
-        ]
+    def find_label(self, point: Point) -> tuple[str, Span] | None:
+        maybe_label = (
+            (name, span)
+            for name, _ in maybe(self.find_symbol(point))
+            for span in maybe(self.labels.get(name))
+        )
+        return next(maybe_label, None)
+
+    def find_refs(self, point: Point) -> Iterable[tuple[str, Span]]:
+        return (
+            (name, span)
+            for name, _ in maybe(self.find_symbol(point))
+            for span, ref_name in self.refs.items()
+            if ref_name == name
+        )
+
+    def definition(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
+        point = Point.from_lsp(pos)
+        return [L.Location(uri, span.lsp) for _, span in maybe(self.find_label(point))]
 
     def references(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
-        if not self.analyzed:
-            return []
-
-        return [
-            L.Location(uri, ref_span.lsp)
-            for symbol_type, label_name, _ in maybe(self.symbol_at(pos))
-            if symbol_type == SymbolType.Label
-            for ref_span, ref_name in self.refs.items()
-            if label_name == ref_name
-        ]
+        point = Point.from_lsp(pos)
+        return [L.Location(uri, span.lsp) for _, span in self.find_refs(point)]
 
     def document_symbol(self) -> Sequence[L.DocumentSymbol]:
-        if not self.analyzed:
-            return []
-
         return [
             L.DocumentSymbol(
                 name=name,
@@ -175,73 +176,42 @@ class Analyzer(NodeVisitor):
         ]
 
     def document_highlight(self, pos: L.Position) -> Sequence[L.DocumentHighlight]:
-        if not self.analyzed:
-            return []
-
-        def to_highlight(span: Span, kind: L.DocumentHighlightKind):
-            return L.DocumentHighlight(span.lsp, kind)
-
-        def highlight_spans():
-            for symbol_type, name, span in maybe(self.symbol_at(pos)):
-                # Highlights the label definition
-                yield to_highlight(
-                    span if symbol_type == SymbolType.Label else self.labels[name],
-                    L.DocumentHighlightKind.Write,
-                )
-
-                # Highlights all the label references
+        def highlights():
+            for name, span in maybe(self.find_label(Point.from_lsp(pos))):
+                # Highlights the definition site.
+                yield L.DocumentHighlight(span.lsp, L.DocumentHighlightKind.Write)
+                # Highlights all reference sites.
                 yield from (
-                    to_highlight(ref_span, L.DocumentHighlightKind.Read)
+                    L.DocumentHighlight(ref_span.lsp, L.DocumentHighlightKind.Read)
                     for ref_span, ref_name in self.refs.items()
                     if ref_name == name
                 )
 
-        return list(highlight_spans())
+        return list(highlights())
 
     def semantic_tokens(self) -> L.SemanticTokens:
         self.tokens.encode()
         return L.SemanticTokens(data=self.tokens.encoded)
 
     def prepare_rename(self, pos: L.Position) -> L.PrepareRenamePlaceholder | None:
-        if not self.analyzed:
-            return None
-
-        for _, name, span in maybe(self.symbol_at(pos)):
+        for name, span in maybe(self.find_symbol(Point.from_lsp(pos))):
             return L.PrepareRenamePlaceholder(span.lsp, name)
 
         return None
 
     def rename(self, uri: str, pos: L.Position, new_name: str) -> L.WorkspaceEdit:
         def text_edits():
-            for symbol_type, name, span in maybe(self.symbol_at(pos)):
-                yield (
-                    L.TextEdit(span.lsp, new_name)
-                    if symbol_type == SymbolType.Label
-                    else L.TextEdit(self.labels[name].lsp, new_name)
-                )
-
+            for name, span in maybe(self.find_label(Point.from_lsp(pos))):
+                # Renames the definition site.
+                yield L.TextEdit(span.lsp, new_name)
+                # Renames all reference sites.
                 yield from (
-                    L.TextEdit(ref_span.lsp, new_name)
-                    for ref_span, ref_name in self.refs.items()
-                    if name == ref_name
+                    L.TextEdit(span.lsp, new_name)
+                    for span, ref_name in self.refs.items()
+                    if ref_name == name
                 )
 
         return L.WorkspaceEdit(changes={uri: list(text_edits())})
-
-    def symbol_at(self, pos: L.Position) -> tuple[SymbolType, str, Span] | None:
-        label = (
-            (SymbolType.Label, name, span)
-            for name, span in self.labels.items()
-            if span.contains(Point.from_lsp(pos))
-        )
-
-        ref = (
-            (SymbolType.Reference, name, span)
-            for span, name in self.refs.items()
-            if span.contains(Point.from_lsp(pos))
-        )
-
-        return next(chain(label, ref), None)
 
     def point_of(self, offset: int) -> Point:
         line = bisect.bisect_right(self.line_offsets, offset) - 1
@@ -312,6 +282,10 @@ class Analyzer(NodeVisitor):
 class ParsimonyServer(LanguageServer):
     analyzer: Analyzer = Analyzer()
 
+    @property
+    def ready(self):
+        return self.analyzer.analyzed
+
     def info(self, message: str):
         self.window_show_message(L.ShowMessageParams(L.MessageType.Info, message))
 
@@ -338,27 +312,29 @@ def did_change(ls: ParsimonyServer, params: L.DidChangeTextDocumentParams):
 
 @server.feature(L.TEXT_DOCUMENT_DEFINITION)
 def definition(ls: ParsimonyServer, params: L.DefinitionParams):
-    return ls.analyzer.definition(params.text_document.uri, params.position)
+    uri = params.text_document.uri
+    return ls.analyzer.definition(uri, params.position) if ls.ready else []
 
 
 @server.feature(L.TEXT_DOCUMENT_REFERENCES)
 def references(ls: ParsimonyServer, params: L.ReferenceParams):
-    return ls.analyzer.references(params.text_document.uri, params.position)
+    uri = params.text_document.uri
+    return ls.analyzer.references(uri, params.position) if ls.ready else []
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
 def document_symbol(ls: ParsimonyServer, _: L.DocumentSymbolParams):
-    return ls.analyzer.document_symbol()
+    return ls.analyzer.document_symbol() if ls.ready else []
 
 
 @server.feature(L.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
 def document_highlight(ls: ParsimonyServer, params: L.DocumentHighlightParams):
-    return ls.analyzer.document_highlight(params.position)
+    return ls.analyzer.document_highlight(params.position) if ls.ready else []
 
 
 @server.feature(L.TEXT_DOCUMENT_PREPARE_RENAME)
 def prepare_rename(ls: ParsimonyServer, params: L.PrepareRenameParams):
-    return ls.analyzer.prepare_rename(params.position)
+    return ls.analyzer.prepare_rename(params.position) if ls.ready else None
 
 
 @server.feature(L.TEXT_DOCUMENT_RENAME)
