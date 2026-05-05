@@ -41,7 +41,8 @@ class Point:
     def from_lsp(pos: L.Position):
         return Point(pos.line, pos.character)
 
-    def to_lsp(self):
+    @property
+    def lsp(self):
         return L.Position(self.line, self.character)
 
 
@@ -53,8 +54,9 @@ class Span:
     def contains(self, point: Point) -> bool:
         return self.start <= point <= self.end
 
-    def to_lsp(self) -> L.Range:
-        return L.Range(self.start.to_lsp(), self.end.to_lsp())
+    @property
+    def lsp(self) -> L.Range:
+        return L.Range(self.start.lsp, self.end.lsp)
 
 
 @dataclass
@@ -141,7 +143,7 @@ class Analyzer(NodeVisitor):
             return []
 
         return [
-            L.Location(uri, self.labels[name].to_lsp())
+            L.Location(uri, self.labels[name].lsp)
             for symbol_type, name, _ in maybe(self.symbol_at(pos))
             if symbol_type == SymbolType.Reference
         ]
@@ -151,7 +153,7 @@ class Analyzer(NodeVisitor):
             return []
 
         return [
-            L.Location(uri, ref_span.to_lsp())
+            L.Location(uri, ref_span.lsp)
             for symbol_type, label_name, _ in maybe(self.symbol_at(pos))
             if symbol_type == SymbolType.Label
             for ref_span, ref_name in self.refs.items()
@@ -166,8 +168,8 @@ class Analyzer(NodeVisitor):
             L.DocumentSymbol(
                 name=name,
                 kind=L.SymbolKind.Constructor,
-                range=span.to_lsp(),
-                selection_range=span.to_lsp(),
+                range=span.lsp,
+                selection_range=span.lsp,
             )
             for name, span in self.labels.items()
         ]
@@ -177,7 +179,7 @@ class Analyzer(NodeVisitor):
             return []
 
         def to_highlight(span: Span, kind: L.DocumentHighlightKind):
-            return L.DocumentHighlight(span.to_lsp(), kind)
+            return L.DocumentHighlight(span.lsp, kind)
 
         def highlight_spans():
             for symbol_type, name, span in maybe(self.symbol_at(pos)):
@@ -205,7 +207,7 @@ class Analyzer(NodeVisitor):
             return None
 
         for _, name, span in maybe(self.symbol_at(pos)):
-            return L.PrepareRenamePlaceholder(span.to_lsp(), name)
+            return L.PrepareRenamePlaceholder(span.lsp, name)
 
         return None
 
@@ -213,13 +215,13 @@ class Analyzer(NodeVisitor):
         def text_edits():
             for symbol_type, name, span in maybe(self.symbol_at(pos)):
                 yield (
-                    L.TextEdit(span.to_lsp(), new_name)
+                    L.TextEdit(span.lsp, new_name)
                     if symbol_type == SymbolType.Label
-                    else L.TextEdit(self.labels[name].to_lsp(), new_name)
+                    else L.TextEdit(self.labels[name].lsp, new_name)
                 )
 
                 yield from (
-                    L.TextEdit(ref_span.to_lsp(), new_name)
+                    L.TextEdit(ref_span.lsp, new_name)
                     for ref_span, ref_name in self.refs.items()
                     if name == ref_name
                 )
