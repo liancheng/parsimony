@@ -118,15 +118,9 @@ class Analyzer(NodeVisitor):
         return self
 
     def analyze(self, node: Node):
-        lines = node.full_text.splitlines(keepends=True)
-
-        # When the source ends with a newline, `str.splitlines` does not preserve the
-        # last empty line.
-        if node.full_text.endswith("\n"):
-            lines.append("")
-
         # Computes the character offset of the first character in each line, used for
-        # conversions between 2D points and 1D offsets.
+        # converting 1D offsets to 2D points.
+        lines = (node.full_text + "\0").splitlines(keepends=True)
         self.line_offsets: list[int] = list(accumulate(chain([0], map(len, lines))))
 
         self.visit(node)
