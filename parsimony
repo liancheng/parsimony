@@ -213,6 +213,15 @@ class Analyzer(NodeVisitor):
 
         return L.WorkspaceEdit(changes={uri: list(text_edits())})
 
+    def diagnostic(self) -> L.DocumentDiagnosticReport:
+        return L.RelatedFullDocumentDiagnosticReport(
+            [
+                L.Diagnostic(span.lsp, f'Label undefined: "{name}"')
+                for span, name in self.refs.items()
+                if name not in self.labels.keys()
+            ]
+        )
+
     def point_of(self, offset: int) -> Point:
         line = bisect.bisect_right(self.line_offsets, offset) - 1
         column = offset - self.line_offsets[line]
@@ -352,7 +361,12 @@ def rename(ls: ParsimonyServer, params: L.RenameParams):
     ),
 )
 def semantic_tokens_full(ls: ParsimonyServer, _: L.SemanticTokensParams):
-    return ls.analyzer.semantic_tokens()
+    return ls.analyzer.semantic_tokens() if ls.ready else None
+
+
+@server.feature(L.TEXT_DOCUMENT_DIAGNOSTIC)
+def diagnostic(ls: ParsimonyServer, _: L.DocumentDiagnosticParams):
+    return ls.analyzer.diagnostic() if ls.ready else None
 
 
 if __name__ == "__main__":
