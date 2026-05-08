@@ -363,6 +363,14 @@ def diagnostic(ls: ParsimonyServer, _: L.DocumentDiagnosticParams):
     return ls.analyzer.diagnostic() if ls.ready else None
 
 
+@server.feature(L.TEXT_DOCUMENT_COMPLETION)
+def completion(ls: ParsimonyServer, _: L.CompletionParams):
+    return [
+        L.CompletionItem(label=label, kind=L.CompletionItemKind.Constructor)
+        for label in ls.analyzer.labels.keys()
+    ]
+
+
 if __name__ == "__main__":
     server.start_io()
 
