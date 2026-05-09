@@ -367,7 +367,10 @@ def diagnostic(ls: ParsimonyServer, _: L.DocumentDiagnosticParams):
 def completion(ls: ParsimonyServer, _: L.CompletionParams):
     return [
         L.CompletionItem(label=label, kind=L.CompletionItemKind.Constructor)
-        for label in ls.analyzer.labels.keys()
+        for label in chain(
+            ls.analyzer.labels.keys(),
+            set(ls.analyzer.refs.values()),
+        )
     ]
 
 
