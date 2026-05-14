@@ -291,9 +291,6 @@ class ParsimonyServer(LanguageServer):
     def ready(self):
         return self.analyzer.analyzed
 
-    def info(self, message: str):
-        self.window_show_message(L.ShowMessageParams(L.MessageType.Info, message))
-
 
 server = ParsimonyServer(
     name="parsimony",
@@ -344,17 +341,13 @@ def prepare_rename(ls: ParsimonyServer, params: L.PrepareRenameParams):
 
 @server.feature(L.TEXT_DOCUMENT_RENAME)
 def rename(ls: ParsimonyServer, params: L.RenameParams):
-    return ls.analyzer.rename(
-        params.text_document.uri, params.position, params.new_name
-    )
+    uri = params.text_document.uri
+    return ls.analyzer.rename(uri, params.position, params.new_name)
 
 
 @server.feature(
     L.TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL,
-    L.SemanticTokensLegend(
-        token_types=list(L.SemanticTokenTypes),
-        token_modifiers=[],
-    ),
+    L.SemanticTokensLegend(token_types=list(L.SemanticTokenTypes), token_modifiers=[]),
 )
 def semantic_tokens_full(ls: ParsimonyServer, _: L.SemanticTokensParams):
     return ls.analyzer.semantic_tokens() if ls.ready else None
@@ -376,5 +369,3 @@ def completion(ls: ParsimonyServer, _: L.CompletionParams):
 
 if __name__ == "__main__":
     server.start_io()
-
-# vim:ft=python

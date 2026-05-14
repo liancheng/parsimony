@@ -11,7 +11,7 @@ vim.lsp.config["parsimonious"] = {
 		"run",
 		"--script",
 		-- NOTE: Please replace this URL with a local path for daily use.
-		"https://raw.githubusercontent.com/liancheng/parsimony/refs/heads/master/parsimony",
+		"https://raw.githubusercontent.com/liancheng/parsimony/refs/heads/master/parsimony.py",
 	},
 	filetypes = { "parsimonious" },
 	root_dir = nil,

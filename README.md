@@ -10,7 +10,7 @@ Parsimony is a [PEP 723][pep-723] Python script that runs via [`uv`][uv]. For a 
 nvim --clean -u init.lua parsimonious.grammar
 ```
 
-For daily use, download the `parsimony` script and replace the GitHub URL in `init.lua` with its local path.
+For daily use, download the `parsimony.py` script and replace the GitHub URL in `init.lua` with its local path.
 
 ## Features
 
