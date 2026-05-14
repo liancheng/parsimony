@@ -80,11 +80,11 @@ class SemanticTokensEncoder:
         self.tokens.sort(key=lambda token: token.start)
         self.encoded = []
 
-        last_line = 0
+        last_start_line = 0
         last_start_char = 0
 
         for token in self.tokens:
-            delta_start_line = token.start.line - last_line
+            delta_start_line = token.start.line - last_start_line
 
             # `delta_start_char` must be absolute if the current token is on a different
             # line than the last token.
@@ -94,15 +94,18 @@ class SemanticTokensEncoder:
                 else token.start.character - last_start_char
             )
 
-            last_line = token.start.line
-            last_start_char = token.start.character
-
             self.encoded.append(delta_start_line)
             self.encoded.append(delta_start_char)
             self.encoded.append(token.length)
             self.encoded.append(TOKEN_TYPE_INDEX[token.type])
             # Token modifiers, not used, always 0
             self.encoded.append(0)
+
+            last_start_line = token.start.line
+            last_start_char = token.start.character
+
+
+Symbol = tuple[str, Span]
 
 
 class Analyzer(NodeVisitor):
@@ -126,7 +129,7 @@ class Analyzer(NodeVisitor):
         self.visit(node)
         self.analyzed = True
 
-    def find_symbol(self, point: Point) -> tuple[str, Span] | None:
+    def find_symbol(self, point: Point) -> Symbol | None:
         labels = self.labels.items()
         refs = ((name, span) for span, name in self.refs.items())
         symbols = chain(labels, refs)
@@ -134,7 +137,7 @@ class Analyzer(NodeVisitor):
             ((name, span) for name, span in symbols if span.contains(point)), None
         )
 
-    def find_label(self, point: Point) -> tuple[str, Span] | None:
+    def find_label(self, point: Point) -> Symbol | None:
         maybe_label = (
             (name, span)
             for name, _ in maybe(self.find_symbol(point))
@@ -142,13 +145,16 @@ class Analyzer(NodeVisitor):
         )
         return next(maybe_label, None)
 
-    def find_refs(self, point: Point) -> Iterable[tuple[str, Span]]:
+    def find_refs(self, point: Point) -> Iterable[Symbol]:
         return (
             (name, span)
             for name, _ in maybe(self.find_symbol(point))
             for span, ref_name in self.refs.items()
             if ref_name == name
         )
+
+    def ref_spans_of(self, name: str) -> Iterable[Span]:
+        return (span for span, ref_name in self.refs.items() if ref_name == name)
 
     def definition(self, uri: str, pos: L.Position) -> Sequence[L.Location]:
         point = Point.from_lsp(pos)
@@ -177,8 +183,7 @@ class Analyzer(NodeVisitor):
                 # Highlights all reference sites.
                 yield from (
                     L.DocumentHighlight(ref_span.lsp, L.DocumentHighlightKind.Read)
-                    for ref_span, ref_name in self.refs.items()
-                    if ref_name == name
+                    for ref_span in self.ref_spans_of(name)
                 )
 
         return list(highlights())
@@ -191,8 +196,6 @@ class Analyzer(NodeVisitor):
         for name, span in maybe(self.find_symbol(Point.from_lsp(pos))):
             return L.PrepareRenamePlaceholder(span.lsp, name)
 
-        return None
-
     def rename(self, uri: str, pos: L.Position, new_name: str) -> L.WorkspaceEdit:
         def text_edits():
             for name, span in maybe(self.find_label(Point.from_lsp(pos))):
@@ -200,9 +203,8 @@ class Analyzer(NodeVisitor):
                 yield L.TextEdit(span.lsp, new_name)
                 # Renames all reference sites.
                 yield from (
-                    L.TextEdit(span.lsp, new_name)
-                    for span, ref_name in self.refs.items()
-                    if ref_name == name
+                    L.TextEdit(ref_span.lsp, new_name)
+                    for ref_span in self.ref_spans_of(name)
                 )
 
         return L.WorkspaceEdit(changes={uri: list(text_edits())})
@@ -365,12 +367,10 @@ def diagnostic(ls: ParsimonyServer, _: L.DocumentDiagnosticParams):
 
 @server.feature(L.TEXT_DOCUMENT_COMPLETION)
 def completion(ls: ParsimonyServer, _: L.CompletionParams):
+    names = set(ls.analyzer.labels) | set(ls.analyzer.refs.values())
     return [
-        L.CompletionItem(label=label, kind=L.CompletionItemKind.Constructor)
-        for label in chain(
-            ls.analyzer.labels.keys(),
-            set(ls.analyzer.refs.values()),
-        )
+        L.CompletionItem(label=name, kind=L.CompletionItemKind.Constructor)
+        for name in names
     ]
 
 
